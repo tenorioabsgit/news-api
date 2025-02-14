@@ -1,0 +1,99 @@
+# Carregar os pacotes
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(janitor)
+library(bigrquery)
+library(DBI)
+library(httr)
+
+# Sua chave de API
+api_key <- '3b33a7e0672242e2bda81ed05f632269'
+
+# Configurações de segurança e autenticação
+httr::set_config(httr::config(ssl_verifypeer = 0L))
+httr::set_config(httr::config(http_version = 0))
+options(httr_oob_default = TRUE)
+
+# Autenticar no BigQuery
+bigrquery::bq_auth(path = "noticias-423520-b345720d776b.json")
+
+# Definir projeto e dataset no BigQuery
+billing <- "noticias-423520"
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = billing,
+  dataset = "noticias",
+  billing = billing
+)
+
+# Definir datas de início e fim no formato "YYYY-MM-DD"
+to_date <- Sys.Date()
+from_date <- to_date - days(30)
+
+# Lista de termos de busca
+lista_termos <- c(
+  'ANPD', 'LGPD', 'GDPR', 'RGPD', 'dados pessoais', 'DPO',
+  'violação de dados', 'vazamento de dados', 'data breach', 'proteção de dados'
+)
+
+# Função para buscar notícias e carregá-las no BigQuery
+fetch_and_load_news <- function(term) {
+  params <- list(
+    apiKey = api_key,
+    q = term,
+    language = 'pt',
+    sortBy = 'relevancy',
+    from = from_date,
+    to = to_date
+  )
+  
+  response <- GET("https://newsapi.org/v2/everything", query = params)
+  
+  if (response$status_code == 200) {
+    content_data <- fromJSON(content(response, "text"), flatten = TRUE)
+    
+    if (!is.null(content_data$articles) && length(content_data$articles) > 0) {
+      articles <- clean_names(content_data$articles)
+      
+      if (nrow(articles) > 0) {
+        print(paste0("Foram encontradas ", nrow(articles), " notícias com o termo ", term))
+        
+        articles <- articles %>% mutate_all(as.character)
+        
+        bigrquery::dbWriteTable(
+          con,
+          "noticias_news_api",
+          articles,
+          append = TRUE,
+          verbose = TRUE,
+          row.names = FALSE,
+          overwrite = FALSE,
+          fields = articles
+        )
+        print("Dataframe Ocorrencias Uploaded")
+      } else {
+        print(paste0("Não foram encontradas notícias com o termo ", term))
+      }
+    } else {
+      print(paste0("Não foram encontradas notícias com o termo ", term))
+    }
+  } else {
+    print(paste0("Erro na requisição com o termo ", term, ": ", response$status_code))
+  }
+}
+
+# Executar a função para cada termo na lista
+walk(lista_termos, fetch_and_load_news)
+
+# Query para eliminar duplicatas
+sql <- "
+CREATE OR REPLACE TABLE
+`noticias-423520.noticias.noticias_news_api` AS
+SELECT DISTINCT *
+FROM
+    `noticias-423520.noticias.noticias_news_api`
+ORDER BY
+    published_at DESC
+"
+invisible(capture.output(dbSendQuery(con, sql)))

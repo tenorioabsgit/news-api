@@ -1,0 +1,159 @@
+# Carregar pacotes necessários
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(janitor)
+library(bigrquery)
+library(DBI)
+
+# Sua chave de API
+api_key <- '3b33a7e0672242e2bda81ed05f632269'
+
+# Configurações de segurança e autenticação
+httr::set_config(httr::config(ssl_verifypeer = 0L))
+httr::set_config(httr::config(http_version = 0))
+options(httr_oob_default = TRUE)
+
+# Autenticar no BigQuery
+bigrquery::bq_auth(path = "noticias-423520-b345720d776b.json")
+
+# Definir projeto e dataset no BigQuery
+billing <- "noticias-423520"
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = billing,
+  dataset = "noticias",
+  billing = billing
+)
+
+# Definir datas de início e fim no formato "YYYY-MM-DD"
+to_date <- Sys.Date()
+from_date <- to_date - days(30)
+
+# Lista de termos de busca
+lista_termos <- c(
+  'ANPD', 'LGPD', 'GDPR', 'RGPD', 'dados pessoais', 'DPO',
+  'violação de dados', 'vazamento de dados', 'data breach', 'proteção de dados'
+)
+
+# Função auxiliar para converter a resposta da API em um data frame limpo
+process_response <- function(response, term) {
+  if (!is.null(response$articles) && length(response$articles) > 0) {
+    articles <- clean_names(response$articles)
+    if (nrow(articles) > 0) {
+      articles <- articles %>%
+        mutate_all(as.character) %>%
+        mutate(term_busca = term)  # Adiciona coluna com termo de busca
+      return(articles)
+    }
+  }
+  return(NULL)
+}
+
+# Função para buscar notícias por dia
+fetch_news_by_day <- function(term, from_date, to_date) {
+  # Sequência de datas diárias
+  dates_seq <- seq(from_date, to_date, by = "1 day")
+  
+  # Inicializar lista para armazenar resultados diários
+  all_articles <- list()
+  
+  for (i in seq_along(dates_seq)) {
+    day_start <- dates_seq[i]
+    day_end <- day_start + days(1)
+    
+    params <- list(
+      apiKey = api_key,
+      q = term,
+      language = 'pt',
+      sortBy = 'relevancy',
+      from = day_start,
+      to = day_end,
+      pageSize = 100  # Limite de 100 por requisição
+    )
+    
+    response <- tryCatch({
+      GET("https://newsapi.org/v2/everything", query = params)
+    }, error = function(e) {
+      message(paste("Erro ao buscar notícias para o termo", term, ":", e))
+      return(NULL)
+    })
+    
+    if (!is.null(response) && response$status_code == 200) {
+      content_data <- fromJSON(content(response, "text"), flatten = TRUE)
+      articles <- process_response(content_data, term)
+      if (!is.null(articles)) {
+        all_articles[[length(all_articles) + 1]] <- articles
+      }
+    } else {
+      message(paste("Erro na requisição com o termo", term, ": código", response$status_code))
+    }
+  }
+  
+  # Retorna o dataframe consolidado das buscas diárias
+  if (length(all_articles) > 0) {
+    return(bind_rows(all_articles))
+  } else {
+    return(NULL)
+  }
+}
+
+# Função principal para executar a busca e carregar no BigQuery
+fetch_and_load_news <- function() {
+  # Inicializar uma lista para armazenar todos os resultados
+  all_data <- list()
+  
+  for (term in lista_termos) {
+    message(paste("Buscando notícias para o termo:", term))
+    
+    articles <- fetch_news_by_day(term, from_date, to_date)
+    
+    if (!is.null(articles) && nrow(articles) > 0) {
+      print(paste0("Foram encontradas ", nrow(articles), " notícias com o termo ", term))
+      
+      # Adiciona ao ambiente global e à lista de todos os dados
+      assign(paste0("noticias_", term), articles, envir = .GlobalEnv)
+      all_data[[length(all_data) + 1]] <- articles
+      
+      # Carregar no BigQuery
+      bigrquery::dbWriteTable(
+        con,
+        "noticias_news_api",
+        articles,
+        append = TRUE,
+        verbose = TRUE,
+        row.names = FALSE,
+        overwrite = FALSE,
+        fields = articles
+      )
+      print("Dataframe carregado no BigQuery.")
+    } else {
+      print(paste0("Não foram encontradas notícias com o termo ", term))
+    }
+  }
+  
+  # Retorna um único dataframe consolidado
+  if (length(all_data) > 0) {
+    all_articles <- bind_rows(all_data)
+    assign("noticias_completas", all_articles, envir = .GlobalEnv)
+    return(all_articles)
+  } else {
+    return(NULL)
+  }
+}
+
+# Executar a função principal para buscar notícias e carregar no BigQuery
+fetch_and_load_news()
+
+# Query para eliminar duplicatas no BigQuery
+sql <- "
+CREATE OR REPLACE TABLE
+`noticias-423520.noticias.noticias_news_api` AS
+SELECT DISTINCT *
+FROM
+    `noticias-423520.noticias.noticias_news_api`
+ORDER BY
+    published_at DESC
+"
+invisible(capture.output(dbSendQuery(con, sql)))
+
