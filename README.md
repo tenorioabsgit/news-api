@@ -104,10 +104,4 @@ from_date <- Sys.Date() - days(7)  # Buscar apenas os últimos 7 dias
 
 ---
 
-## 👨‍💻 Autor
-
-👤 **José Tenório Abs Junior**  
-📧 [Seu Email]  
-🏛 **IBPAD - Instituto Brasileiro de Pesquisa e Análise de Dados**  
-
 🚀 **Agora você pode coletar notícias automaticamente!** Qualquer dúvida, me avise! 😊
